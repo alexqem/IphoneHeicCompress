@@ -3,7 +3,7 @@ from PIL import Image, ImageEnhance
 import pillow_heif
 from pathlib import Path
 import io
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 import threading
 
 # Global Variables
@@ -14,160 +14,140 @@ MAX_SIDE = 1600
 MAX_SIZE_KB = 1024
 INPUT_DIR = "./MyHair"
 OUTPUT_DIR = "./newHair"
-
 print_lock = threading.Lock()
 
 def safe_print(*args, **kwargs):
-    """Thread-safe printing"""
     with print_lock:
         print(*args, **kwargs)
 
-def resize_image(image, max_side=MAX_SIDE):
-    """Resize image if any dimension exceeds max_side"""
+def copy_file_metadata(src_path, dst_path):
+    """Copy file metadata from source to destination"""
+    try:
+        # Get source file's stats
+        src_stat = os.stat(src_path)
+        
+        # Copy access and modification times
+        os.utime(dst_path, (src_stat.st_atime, src_stat.st_mtime))
+        
+        # On macOS, use touch command with reference to preserve creation time
+        if platform.system() == 'Darwin':  # macOS
+            os.system(f"touch -r '{src_path}' '{dst_path}'")
+            
+    except Exception as e:
+        safe_print(f"Warning: Could not copy metadata: {e}")
+
+def resize_image(image):
+    if image is None:
+        raise ValueError("Image is None in resize_image")
     width, height = image.size
-    if width > max_side or height > max_side:
-        # Calculate new dimensions maintaining aspect ratio
-        ratio = min(max_side/width, max_side/height)
-        new_width = int(width * ratio)
-        new_height = int(height * ratio)
-        return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    if max(width, height) > MAX_SIDE:
+        ratio = min(MAX_SIDE / width, MAX_SIDE / height)
+        return image.resize((int(width * ratio), int(height * ratio)), Image.Resampling.LANCZOS)
     return image
 
-def compress_image(image, max_size_kb=MAX_SIZE_KB):
-    """
-    Iteratively compress image until target size is reached while maintaining quality
-    """
-    quality = 95
-    min_quality = 30
-    target_size = max_size_kb * 1024
-    
-    webp_buffer = io.BytesIO()
-    image.save(webp_buffer, format="WEBP", quality=quality)
-    
-    webp_buffer.seek(0)
-    image = Image.open(webp_buffer)
-    
-    while quality > min_quality:
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=quality, optimize=True)
-        if buffer.tell() <= target_size:
-            buffer.seek(0)
-            return Image.open(buffer)
-        quality -= 5
-    
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=min_quality, optimize=True)
-    buffer.seek(0)
-    return Image.open(buffer)
+def enhance_image(image):
+    if image is None:
+        raise ValueError("Image is None in enhance_image")
+    try:
+        image = ImageEnhance.Sharpness(image).enhance(SHARPNESS_FACTOR)
+        image = ImageEnhance.Contrast(image).enhance(VIBRANCE_FACTOR)
+        return ImageEnhance.Color(image).enhance(SATURATION_FACTOR)
+    except Exception as e:
+        safe_print(f"Enhancement error: {e}")
+        return image
 
-def process_single_image(file, output_dir, max_size_kb=MAX_SIZE_KB, sharpness_factor=SHARPNESS_FACTOR, max_side=MAX_SIDE):
-    """Process a single image file"""
+def process_image(file):
     try:
         safe_print(f"Processing: {file.name}")
         
-        # Open HEIC image
-        image = Image.open(file)
+        # Verify file exists and is readable
+        if not file.exists():
+            raise FileNotFoundError(f"File not found: {file}")
         
-        # Convert to RGB
+        # Try to open the HEIC file directly with pillow_heif
+        try:
+            heif_file = pillow_heif.read_heif(str(file))
+            image = Image.frombytes(
+                heif_file.mode,
+                heif_file.size,
+                heif_file.data,
+                "raw",
+                heif_file.mode,
+                heif_file.stride,
+            )
+        except Exception as e:
+            safe_print(f"HEIF reading failed, trying PIL: {e}")
+            # Fallback to PIL
+            image = Image.open(file)
+        
+        if image is None:
+            raise ValueError("Unable to open image, file may be corrupted.")
+        
+        # Convert to RGB early to ensure consistent color space
         image = image.convert('RGB')
         
-        # Resize if needed
-        image = resize_image(image, max_side)
+        # Process the image
+        image = resize_image(image)
+        image = enhance_image(image)
         
-        # Adjust sharpness
-        enhancer = ImageEnhance.Sharpness(image)
-        sharpened_image = enhancer.enhance(sharpness_factor)
+        # Save the processed image
+        output_path = Path(OUTPUT_DIR) / f"{file.stem}.jpg"
         
-        # Increase vibrance (through contrast)
-        enhancer = ImageEnhance.Contrast(sharpened_image)
-        vibrant_image = enhancer.enhance(VIBRANCE_FACTOR)  # +10%
+        # Progressive save with quality reduction until size requirement is met
+        quality = 95
+        while quality > 30:
+            try:
+                image.save(output_path, 
+                          "JPEG", 
+                          quality=quality, 
+                          optimize=True, 
+                          progressive=True)
+                
+                # Check if file size meets requirements
+                if os.path.getsize(output_path) <= MAX_SIZE_KB * 1024:
+                    break
+                
+                quality -= 5
+                
+            except Exception as e:
+                safe_print(f"Save attempt failed at quality {quality}: {e}")
+                quality -= 5
+                continue
         
-        # Increase saturation
-        enhancer = ImageEnhance.Color(vibrant_image)
-        saturated_image = enhancer.enhance(SATURATION_FACTOR)  # +15%
+        if quality <= 30:
+            safe_print(f"Warning: Could not compress {file.name} to target size while maintaining quality")
         
-        # Update the image for compression (replace this line)
-        compressed_image = compress_image(saturated_image, max_size_kb)
-
+        # Copy metadata from source to destination
+        copy_file_metadata(file, output_path)
         
-        # Save as JPG
-        jpg_path = Path(output_dir) / f"{file.stem}.jpg"
-        compressed_image.save(
-            jpg_path,
-            'JPEG',
-            optimize=True,
-            progressive=True
-        )
-        
-        # Get original and new file sizes
-        original_size = os.path.getsize(file)
-        new_size = os.path.getsize(jpg_path)
-        compression_ratio = (1 - new_size/original_size) * 100
-        
-        safe_print(f"Success: {file.name}")
-        safe_print(f"Size reduction: {original_size/1024/1024:.1f}MB → {new_size/1024/1024:.1f}MB")
-        safe_print(f"Compression ratio: {compression_ratio:.1f}%")
-        
-        return True
+        safe_print(f"Success: {file.name} → {output_path.name}")
         
     except Exception as e:
         safe_print(f"Error processing {file.name}: {str(e)}")
-        return False
+        import traceback
+        safe_print(traceback.format_exc())
 
-def process_images(input_dir=INPUT_DIR, output_dir=OUTPUT_DIR, max_size_kb=MAX_SIZE_KB, 
-                  sharpness_factor=SHARPNESS_FACTOR, max_side=MAX_SIDE):
-    """
-    Convert HEIC images to highly optimized JPG with multithreading
-    """
-    # Convert to absolute paths
-    input_dir = os.path.abspath(input_dir)
-    output_dir = os.path.abspath(output_dir)
-    
-    safe_print(f"Input directory: {input_dir}")
-    safe_print(f"Output directory: {output_dir}")
-    
-    # Verify input directory exists
-    if not os.path.exists(input_dir):
-        safe_print(f"Error: Input directory '{input_dir}' does not exist!")
-        return
-    
-    # Register HEIF opener
+def process_images():
     pillow_heif.register_heif_opener()
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # Create output directory if it doesn't exist
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Find all HEIC files (case insensitive)
-    heic_files = []
-    for ext in ['*.HEIC', '*.heic']:
-        heic_files.extend(Path(input_dir).glob(ext))
-    
-    if not heic_files:
-        safe_print(f"No HEIC files found in {input_dir}")
+    if not os.path.exists(INPUT_DIR):
+        safe_print(f"Input directory {INPUT_DIR} does not exist!")
         return
     
-    safe_print(f"Found {len(heic_files)} HEIC files")
+    files = list(Path(INPUT_DIR).glob("*.HEIC")) + list(Path(INPUT_DIR).glob("*.heic"))
     
-    # Process images in parallel
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = [
-            executor.submit(
-                process_single_image, 
-                file, 
-                output_dir, 
-                max_size_kb, 
-                sharpness_factor,
-                max_side
-            )
-            for file in heic_files
-        ]
-        
-        concurrent.futures.wait(futures)
+    if not files:
+        safe_print(f"No HEIC files found in {INPUT_DIR}")
+        return
     
-    # Count successes
-    successes = sum(1 for future in futures if future.result())
-    safe_print(f"\nProcessing complete: {successes}/{len(heic_files)} images converted successfully")
+    safe_print(f"Found {len(files)} HEIC files. Processing...")
+    
+    with ThreadPoolExecutor() as executor:
+        executor.map(process_image, files)
+    
+    safe_print("Processing complete.")
 
 if __name__ == "__main__":
-    # Use default directories and settings
+    import platform
     process_images()
