@@ -15,8 +15,9 @@ This repository contains a Python script to compress iPhone photos from HEIC for
 - Python 3.6+
 - Pillow
 - Pillow-HEIF
+- Pieexif
 ```bash
-pip install pillow pillow-heif
+pip install pillow pillow-heif pieexif
 ```
 
 ## Installation
